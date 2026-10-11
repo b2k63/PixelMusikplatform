@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accord Tempo — Let It Be</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted></video>
+
+<script type="module">
+// ─────────────────────────────────────────────────────────────
+//  ACCORD TEMPO — Let It Be (Beatles)  ·  version web
+//  Portage du sketch Processing (AccordTempo10.pde)
+//
+//  Phase 1 : jouer les 8 accords un par un
+//  Écran intermédiaire : Bravo
+//  Phase 2 : suivre la mélodie avec les deux mains → score %
+//
+//  Suivi des mains : MediaPipe Pose (dans le navigateur, sans OSC ni Python)
+// ─────────────────────────────────────────────────────────────
+import { PoseLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ── Réglages ──────────────────────────────────────────────────
+const PIXEL_SIZE = 9;      // taille des pixels de la silhouette
+const THRESHOLD  = 128;    // seuil de luminosité de la silhouette
+const Y_GAIN     = 1.25;   // amplifie le mouvement vertical des mains (1 = brut)
+const SM         = 0.08;   // lissage des mains
+const LC         = 0.03;   // lissage des cibles (phase 2)
+
+// ── Let It Be — 8 accords ─────────────────────────────────────
+// Do - Sol - Lam - Fa - Do - Sol - Fa - Do   (72 BPM : blanche = 833 ms, ronde = 1666 ms)
+const N = 8;
+const NOM_ACCORD = ["Do majeur","Sol majeur","La mineur","Fa majeur","Do majeur","Sol majeur","Fa majeur","Do majeur"];
+const NOM_BASSE  = ["Do","Sol","La","Fa","Do","Sol","Fa","Do"];
+const NOM_HAUTE  = ["Mi","Si","Do","La","Mi","Si","La","Mi"];
+const FREQ_BASSE = [261.63,196.00,220.00,174.61,261.63,196.00,174.61,261.63];
+const FREQ_HAUTE = [329.63,246.94,261.63,220.00,329.63,246.94,220.00,329.63];
+const DUREES     = [1666,1666,833,1666,1666,833,833,1666];
+
+// ── Couleurs / helpers ────────────────────────────────────────
+const CYAN = [0,210,200], MAG = [220,30,130], BLK = [0,0,0];
+const rgba  = (c, a = 255) => `rgba(${c[0]},${c[1]},${c[2]},${a/255})`;
+const lerp  = (a, b, t) => a + (b - a) * t;
+const map   = (v, a, b, c, d) => c + (v - a) * (d - c) / (b - a);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+// ── Canvas ────────────────────────────────────────────────────
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const video = document.getElementById("cam");
+let W = 0, H = 0, U = 1, dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  U = Math.max(0.6, Math.min(1.15, Math.min(W / 1100, H / 700)));  // échelle de l'interface
+}
+window.addEventListener("resize", resize);
+resize();
+const u   = v => v * U;
+const yPx = v => map(v, 0, 1, H - u(40), u(40));   // 0 = bas de l'écran, 1 = haut
+
+function txt(s, x, y, size, col, o = {}) {
+  const { bold = true, align = "center", base = "middle" } = o;
+  ctx.font = `${bold ? 700 : 400} ${size * U}px "Courier Prime","Courier New",monospace`;
+  ctx.textAlign = align; ctx.textBaseline = base; ctx.fillStyle = col;
+  ctx.fillText(s, x, y);
+}
+function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+function circle(x, y, d, fill) { ctx.beginPath(); ctx.arc(x, y, d / 2, 0, Math.PI * 2); fill ? ctx.fill() : ctx.stroke(); }
+
+// ── Mains (valeurs 0..1, 0 = bas, 1 = haut) ───────────────────
+let personCount = 0;
+let rawBY = 0.5, rawHY = 0.5;   // main « basse » / main « haute » brutes
+let sBY = 0.5,  sHY = 0.5;      // lissées
+let swapHands = false;          // inverse quelle main joue quelle note
+const labBass = () => swapHands ? "Main gauche" : "Main droite";
+const labHigh = () => swapHands ? "Main droite" : "Main gauche";
+
+// ── Audio (Web Audio) ─────────────────────────────────────────
+let actx = null, v = null;
+function initAudio() {
+  if (actx) { actx.resume(); return; }
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  const master = actx.createGain(); master.gain.value = 0.9; master.connect(actx.destination);
+  const mk = type => {
+    const o = actx.createOscillator(); o.type = type;
+    const g = actx.createGain(); g.gain.value = 0;
+    o.connect(g); g.connect(master); o.start();
+    return { o, g, amp: 0, freq: 0 };
+  };
+  v = { b: mk("triangle"), h: mk("triangle"), s: mk("sine") };
+}
+function ampOf(x, a) {
+  if (!x || Math.abs(x.amp - a) < 1e-4) return;
+  x.amp = a; x.g.gain.setTargetAtTime(a, actx.currentTime, 0.015);
+}
+function freqOf(x, f) {
+  if (!x || x.freq === f) return;
+  x.freq = f; x.o.frequency.setTargetAtTime(f, actx.currentTime, 0.008);
+}
+function setFreqs(fb, fh) { if (!v) return; freqOf(v.b, fb); freqOf(v.h, fh); freqOf(v.s, fb * 0.5); }
+function setAmps(a, b, c) { if (!v) return; ampOf(v.b, a); ampOf(v.h, b); ampOf(v.s, c); }
+const silence = () => setAmps(0, 0, 0);
+document.addEventListener("visibilitychange", () => { if (document.hidden) silence(); });
+
+// ── Caméra + suivi des mains ──────────────────────────────────
+let camReady = false, landmarker = null, lastVideoTime = -1;
+let status = "idle", errMsg = "";    // idle | loading | error
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480, facingMode: "user" }, audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+async function loadTracker() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const make = delegate => PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate
+    },
+    runningMode: "VIDEO", numPoses: 1
+  });
+  try { landmarker = await make("GPU"); }
+  catch (e) { landmarker = await make("CPU"); }   // ordinateurs sans GPU compatible
+}
+const toY = ly => clamp(0.5 + (0.5 - ly) * Y_GAIN, 0, 1);   // image (0 = haut) → 0 = bas, 1 = haut
+
+function track(now) {
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = landmarker.detectForVideo(video, now);
+  personCount = res.landmarks.length;
+  if (personCount > 0) {
+    const p = res.landmarks[0];
+    // 16 = poignet droit, 15 = poignet gauche (côté de la personne)
+    const bass = p[swapHands ? 15 : 16], high = p[swapHands ? 16 : 15];
+    rawBY = toY(bass.y);
+    rawHY = toY(high.y);
+  }
+}
+
+function friendlyError(e) {
+  if (e && (e.name === "NotAllowedError" || e.name === "SecurityError"))
+    return "Caméra refusée. Autorise l'accès à la caméra dans ton navigateur, puis réessaie.";
+  if (e && (e.name === "NotFoundError" || e.name === "OverconstrainedError"))
+    return "Aucune caméra trouvée. Branche une webcam, puis réessaie.";
+  if (!camReady) return "Impossible de démarrer la caméra. Ferme les autres applications qui l'utilisent, puis réessaie.";
+  return "Impossible de charger le suivi des mains. Vérifie ta connexion internet, puis réessaie.";
+}
+
+// ── État du jeu ───────────────────────────────────────────────
+// phases : -1 accueil · 0 accords · 1 bravo · 2 mélodie · 3 résultat
+let phase = -1, accordIdx = 0, bravoStart = 0;
+let nomAccord = "", noteBasseNom = "", noteHauteNom = "", freqBasse = 0, freqHaute = 0;
+let accordLocked = false, accordPlaying = false, accordPlayStart = 0;
+const ACCORD_PLAY_MS = 1000;
+let Y_BASSE = 0.5, Y_HAUTE = 0.5;
+const TOLERANCE = 0.10, HOLD_NEED = 35;
+let timerB = 0, timerH = 0, valB = false, valH = false, holdB = 0, holdH = 0;
+
+let melodieIdx = 0, noteStart = 0;
+let cibleBasseY = 0.12, cibleHauteY = 0.88, targetBY = 0.12, targetHY = 0.88;
+let melodiePrete = false;
+let framesOn = 0, framesTotal = 0, scorePct = 0, onB = false, onH = false;
+let melBasseNom = "", melHauteNom = "", melNomAccord = "";
+
+let halos = [];
+let flashMsg = "", flashCol = CYAN, flashAlpha = 0;
+const flash = (m, c) => { flashMsg = m; flashCol = c; flashAlpha = 255; };
+
+let T = 0, lastT = 0, k = 1;       // temps (ms) et facteur « images de 60 fps »
+let mouseX = -1, mouseY = -1, rects = {};
+
+// ── Boucle principale ─────────────────────────────────────────
+function loop(now) {
+  T = now; k = Math.min(3, (now - lastT) / 16.667); lastT = now;
+  track(now);
+
+  const sm = 1 - Math.pow(1 - SM, k);
+  sBY = lerp(sBY, rawBY, sm);
+  sHY = lerp(sHY, rawHY, sm);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  rects = {};
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
+  drawSilhouette();
+
+  for (let i = halos.length - 1; i >= 0; i--) {
+    const h = halos[i]; h.update(); h.draw();
+    if (h.isDead()) halos.splice(i, 1);
+  }
+
+  if      (phase === -1) drawAccueil();
+  else if (phase === 0)  { updateAccord();  drawAccord();  }
+  else if (phase === 1)  { updateBravo();   drawBravo();   }
+  else if (phase === 2)  { updateMelodie(); drawMelodie(); }
+  else                   drawResultat();
+
+  drawHUD();
+  drawFlash();
+  requestAnimationFrame(loop);
+}
+
+// ── Silhouette pixel noir / fond blanc (miroir) ───────────────
+const sil = document.createElement("canvas");
+const sctx = sil.getContext("2d", { willReadFrequently: true });
+function drawSilhouette() {
+  if (!camReady || video.readyState < 2) return;
+  const ps = Math.max(6, Math.round(PIXEL_SIZE * U));
+  const cols = Math.floor(W / ps), rows = Math.floor(H / ps);
+  if (sil.width !== cols || sil.height !== rows) { sil.width = cols; sil.height = rows; }
+  sctx.save(); sctx.translate(cols, 0); sctx.scale(-1, 1);
+  sctx.drawImage(video, 0, 0, cols, rows);
+  sctx.restore();
+  const d = sctx.getImageData(0, 0, cols, rows).data;
+  ctx.fillStyle = "rgba(0,0,0,0.86)";
+  ctx.beginPath();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const i = (r * cols + c) * 4;
+      if (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] < THRESHOLD)
+        ctx.rect(c * ps, r * ps, ps - 1, ps - 1);
+    }
+  }
+  ctx.fill();
+}
+
+// ── ACCUEIL ───────────────────────────────────────────────────
+function drawAccueil() {
+  silence();
+  txt("ACCORD TEMPO", W/2, H*0.17, 64, rgba(CYAN));
+  ctx.strokeStyle = rgba(CYAN, 50); ctx.lineWidth = 1;
+  line(W/2 - u(220), H*0.245, W/2 + u(220), H*0.245);
+
+  txt("APPRENDS LES ACCORDS PAR LE MOUVEMENT", W/2, H*0.30, 18, rgba(CYAN));
+  txt("PHASE 1  —  PLACE TES MAINS SUR LES CIBLES", W/2, H*0.39,  16, rgba(CYAN));
+  txt("POUR JOUER CHAQUE ACCORD.",                  W/2, H*0.425, 16, rgba(CYAN));
+  txt("PHASE 2  —  SUIS LA MÉLODIE AVEC TES MAINS.", W/2, H*0.50,  16, rgba(CYAN));
+  txt(`${labBass().toUpperCase()} = NOTE BASSE  |  ${labHigh().toUpperCase()} = NOTE HAUTE`,
+      W/2, H*0.575, 13, rgba(CYAN, 170));
+
+  if (status === "loading") {
+    txt("Chargement de la caméra et du suivi des mains…", W/2, H*0.68, 14, rgba(BLK, 150));
+  } else {
+    drawBtn(W/2, H*0.68, u(320), "COMMENCER", "start");
+  }
+  if (status === "error") txt(errMsg, W/2, H*0.68 + u(50), 13, rgba(MAG), { bold: true });
+
+  // Option : inverser les mains (si la caméra les croise)
+  const swapW = u(300), swapH = u(30), sy = H*0.80;
+  rects.swap = { x: W/2 - swapW/2, y: sy - swapH/2, w: swapW, h: swapH };
+  ctx.strokeStyle = rgba(BLK, hit(rects.swap) ? 160 : 70); ctx.lineWidth = 1;
+  ctx.strokeRect(rects.swap.x, rects.swap.y, swapW, swapH);
+  txt(`Mains inversées : ${swapHands ? "oui" : "non"}`, W/2, sy, 12, rgba(BLK, 140), { bold: false });
+
+  txt("Place-toi face à la caméra, les deux bras visibles.", W/2, H - u(16), 11, rgba(BLK, 90),
+      { bold: false, base: "bottom" });
+}
+
+// ── PHASE 1 — ACCORDS ─────────────────────────────────────────
+function loadAccord(idx) {
+  nomAccord = NOM_ACCORD[idx]; noteBasseNom = NOM_BASSE[idx]; noteHauteNom = NOM_HAUTE[idx];
+  freqBasse = FREQ_BASSE[idx]; freqHaute = FREQ_HAUTE[idx];
+  // grave = bas de l'écran, aigu = haut de l'écran
+  Y_BASSE = map(freqBasse, 174.61, 293.66, 0.15, 0.40);
+  Y_HAUTE = map(freqHaute, 220.00, 329.63, 0.60, 0.85);
+  timerB = timerH = holdB = holdH = 0;
+  valB = valH = false; accordLocked = false;
+  silence();
+}
+
+function updateAccord() {
+  if (personCount === 0) { silence(); return; }
+
+  if (accordPlaying) {
+    if (T - accordPlayStart >= ACCORD_PLAY_MS) {
+      accordPlaying = false; silence();
+      if (accordIdx >= N) { phase = 1; bravoStart = T; }
+      else loadAccord(accordIdx);
+    }
+    return;
+  }
+
+  const nearB = Math.abs(sBY - Y_BASSE) < TOLERANCE;
+  const nearH = Math.abs(sHY - Y_HAUTE) < TOLERANCE;
+
+  // Verrou : attendre que les mains quittent les cibles
+  if (accordLocked) { if (!nearB && !nearH) accordLocked = false; return; }
+
+  timerB = nearB ? Math.min(timerB + k, HOLD_NEED) : Math.max(0, timerB - 1.5 * k);
+  holdB = timerB / HOLD_NEED; valB = timerB >= HOLD_NEED;
+  timerH = nearH ? Math.min(timerH + k, HOLD_NEED) : Math.max(0, timerH - 1.5 * k);
+  holdH = timerH / HOLD_NEED; valH = timerH >= HOLD_NEED;
+
+  // Son pendant le maintien
+  setFreqs(freqBasse, freqHaute);
+  setAmps(valB ? 0.22 : 0, valH ? 0.18 : 0, valB ? 0.08 : 0);
+
+  // Les deux validées → jouer 1 seconde
+  if (valB && valH) {
+    accordLocked = true; accordPlaying = true; accordPlayStart = T;
+    setAmps(0.28, 0.22, 0.10);
+    halos.push(new Halo(W*0.22, yPx(Y_BASSE), CYAN));
+    halos.push(new Halo(W*0.78, yPx(Y_HAUTE), CYAN));
+    flash(nomAccord + " !", CYAN);
+    accordIdx++;
+  }
+}
+
+function drawAccord() {
+  const yBas = yPx(Y_BASSE), yHaut = yPx(Y_HAUTE);
+
+  ctx.lineWidth = 1; ctx.setLineDash([u(7), u(7)]);
+  ctx.strokeStyle = rgba(valB ? CYAN : MAG, 55); line(30, yBas, W/2 - u(150), yBas);
+  ctx.strokeStyle = rgba(valH ? CYAN : MAG, 55); line(W/2 + u(150), yHaut, W - 30, yHaut);
+  ctx.setLineDash([]);
+
+  drawCible(W*0.22, yBas,  valB, holdB);
+  drawCible(W*0.78, yHaut, valH, holdH);
+  drawCursor(W*0.22, yPx(sBY), valB);
+  drawCursor(W*0.78, yPx(sHY), valH);
+  drawNoteBox(W*0.22, H/2, noteBasseNom, labBass(), valB, holdB);
+  drawNoteBox(W*0.78, H/2, noteHauteNom, labHigh(), valH, holdH);
+
+  txt(nomAccord, W/2, u(38), 20, rgba(BLK, 210));
+  const shown = Math.min(accordPlaying ? accordIdx : accordIdx + 1, N);
+  txt(`Accord ${shown} / ${N}  —  tiens les deux positions`, W/2, u(62), 11, rgba(CYAN, 170), { bold: false });
+
+  if (accordPlaying) {
+    txt("Écoute l'accord !", W/2, H - u(58), 14, rgba(MAG));
+  } else if (accordLocked) {
+    txt("Écarte les mains pour continuer", W/2, H - u(58), 14, rgba(MAG));
+  } else {
+    txt(`${labBass()} BAS  =  note basse`,  W/2, H - u(72), 14, rgba(MAG));
+    txt(`${labHigh()} HAUT  =  note haute`, W/2, H - u(50), 14, rgba(MAG));
+  }
+  drawProgDots(accordIdx, N, H - u(22));
+}
+
+// ── BRAVO ─────────────────────────────────────────────────────
+function updateBravo() {
+  if (T - bravoStart > 2500) {
+    phase = 2; melodieIdx = 0; framesOn = 0; framesTotal = 0; melodiePrete = false;
+    loadMelodieNote(0, false);   // charge les cibles, sans jouer encore
+    silence();
+  }
+}
+function drawBravo() {
+  ctx.fillStyle = rgba(CYAN, 18); ctx.fillRect(0, 0, W, H);
+  txt("Bravo !", W/2, H/2 - u(50), 42, rgba(CYAN));
+  txt("Tu as joué tous les accords !", W/2, H/2 + u(10), 16, rgba(BLK, 180));
+  txt("Préparation de la mélodie…", W/2, H/2 + u(50), 12, rgba(BLK, 120), { bold: false });
+  const pct = clamp((T - bravoStart) / 2500, 0, 1), bw = u(300), bx = W/2 - bw/2, by = H/2 + u(74);
+  ctx.strokeStyle = rgba(CYAN, 120); ctx.lineWidth = 2; ctx.strokeRect(bx, by, bw, u(6));
+  ctx.fillStyle = rgba(CYAN, 160); ctx.fillRect(bx, by, bw * pct, u(6));
+}
+
+// ── PHASE 2 — MÉLODIE ─────────────────────────────────────────
+function loadMelodieNote(idx, play = true) {
+  const fB = FREQ_BASSE[idx], fH = FREQ_HAUTE[idx];
+  melBasseNom = NOM_BASSE[idx]; melHauteNom = NOM_HAUTE[idx]; melNomAccord = NOM_ACCORD[idx];
+  targetBY = map(fB, 174.61, 293.66, 0.15, 0.40);
+  targetHY = map(fH, 220.00, 329.63, 0.60, 0.85);
+  if (play) { setFreqs(fB, fH); setAmps(0.22, 0.18, 0.08); }
+}
+
+function updateMelodie() {
+  if (melodieIdx >= N) return;
+
+  const lc = 1 - Math.pow(1 - LC, k);
+  cibleBasseY = lerp(cibleBasseY, targetBY, lc);
+  cibleHauteY = lerp(cibleHauteY, targetHY, lc);
+
+  const tol = H * 0.13;
+  onB = Math.abs(yPx(sBY) - yPx(cibleBasseY)) < tol;
+  onH = Math.abs(yPx(sHY) - yPx(cibleHauteY)) < tol;
+
+  // Attendre que les deux mains soient sur la première note pour démarrer
+  if (!melodiePrete) {
+    if (onB && onH && personCount > 0) {
+      melodiePrete = true; noteStart = T;
+      setFreqs(FREQ_BASSE[0], FREQ_HAUTE[0]); setAmps(0.22, 0.18, 0.08);
+    }
+    return;
+  }
+
+  if (T - noteStart >= DUREES[melodieIdx]) {
+    melodieIdx++; noteStart = T;
+    if (melodieIdx >= N) {
+      silence();
+      scorePct = framesTotal > 0 ? (framesOn / (framesTotal * 2)) * 100 : 0;
+      phase = 3;
+      return;
+    }
+    loadMelodieNote(melodieIdx);
+  }
+
+  framesTotal += k;
+  if (onB) framesOn += k;
+  if (onH) framesOn += k;
+}
+
+function drawMelodie() {
+  if (melodieIdx >= N) return;
+  const yB = yPx(cibleBasseY), yH = yPx(cibleHauteY);
+
+  ctx.strokeStyle = rgba(BLK, 14); ctx.lineWidth = 0.5;
+  line(W*0.25, 0, W*0.25, H); line(W*0.75, 0, W*0.75, H);
+
+  drawCible(W*0.25, yB, onB, 0);
+  drawCible(W*0.75, yH, onH, 0);
+  drawCursor(W*0.25, yPx(sBY), onB);
+  drawCursor(W*0.75, yPx(sHY), onH);
+
+  txt(melBasseNom, W*0.25 - u(36), yB, 18, rgba(onB ? CYAN : MAG), { align: "right" });
+  txt(melHauteNom, W*0.75 + u(36), yH, 18, rgba(onH ? CYAN : MAG), { align: "left" });
+
+  txt(melNomAccord, W/2, u(38), 20, rgba(BLK, 210));
+  txt("Suis les notes  —  " + melNomAccord, W/2, u(60), 11, rgba(CYAN, 170), { bold: false });
+
+  txt(melodiePrete ? "Suis les notes avec tes deux mains"
+                   : "Place tes deux mains sur les cibles pour commencer",
+      W/2, H - u(58), 14, rgba(MAG));
+
+  if (melodiePrete) {
+    const prog = clamp((T - noteStart) / DUREES[melodieIdx], 0, 1);
+    ctx.strokeStyle = rgba(BLK, 35); ctx.lineWidth = 1;
+    line(60, H - u(18), W - 60, H - u(18));
+    ctx.strokeStyle = rgba(CYAN, 180); ctx.lineWidth = 2.5;
+    line(60, H - u(18), 60 + prog * (W - 120), H - u(18));
+  }
+  drawProgDots(melodieIdx, N, H - u(34));
+
+  if (framesTotal > 0) {
+    const pct = (framesOn / (framesTotal * 2)) * 100;
+    txt(Math.round(pct) + " %", W - u(16), u(40), 11, rgba(BLK, 130), { align: "right" });
+  }
+}
+
+// ── RÉSULTAT ──────────────────────────────────────────────────
+function drawResultat() {
+  silence();
+  const sc = scorePct >= 80 ? CYAN : scorePct >= 50 ? [255, 170, 0] : MAG;
+  txt(Math.round(scorePct) + "%", W/2, H/2 - u(50), 52, rgba(sc));
+  const msg = scorePct >= 80 ? "Excellent ! Tu suis bien le rythme."
+            : scorePct >= 50 ? "Pas mal ! Continue à t'entraîner."
+            :                  "Rejoue pour améliorer ta précision.";
+  txt(msg, W/2, H/2 + u(16), 18, rgba(BLK, 200));
+  txt("de suivi de la mélodie", W/2, H/2 + u(44), 11, rgba(BLK, 120), { bold: false });
+  drawBtn(W/2, H*0.72, u(280), "Rejouer", "replay");
+}
+
+// ── Composants d'interface ────────────────────────────────────
+function hit(r) { return r && mouseX > r.x && mouseX < r.x + r.w && mouseY > r.y && mouseY < r.y + r.h; }
+
+function drawCible(x, y, valide, prog) {
+  const pulse = 0.5 + 0.5 * Math.sin(T * 0.004);
+  const sz = u(44) + pulse * u(10);
+  const cc = valide ? CYAN : MAG;
+  ctx.strokeStyle = rgba(cc, 25 + pulse * 60); ctx.lineWidth = valide ? 1.5 : 3;
+  circle(x, y, sz + u(36), false);
+  ctx.strokeStyle = rgba(cc, 70 + pulse * 100); ctx.lineWidth = valide ? 2 : 4.5;
+  circle(x, y, sz, false);
+  if (valide) { ctx.fillStyle = rgba(CYAN, 35); circle(x, y, sz, true); }
+  if (!valide && prog > 0) {
+    ctx.strokeStyle = rgba(MAG, 210); ctx.lineWidth = 5.5;
+    ctx.beginPath(); ctx.arc(x, y, (sz + u(16)) / 2, -Math.PI/2, -Math.PI/2 + Math.PI*2*prog); ctx.stroke();
+  }
+  ctx.strokeStyle = rgba(BLK, 12); ctx.lineWidth = 0.5;
+  line(0, y, W, y);
+}
+
+function drawCursor(x, y, valide) {
+  const cc = valide ? CYAN : BLK;
+  ctx.strokeStyle = rgba(cc, 160); ctx.lineWidth = 2; circle(x, y, u(36), false);
+  ctx.strokeStyle = rgba(cc, 45);  ctx.lineWidth = 1; circle(x, y, u(60), false);
+  ctx.fillStyle = rgba(cc, valide ? 160 : 80);        circle(x, y, u(14), true);
+}
+
+function drawNoteBox(cx, cy, nom, label, valide, prog) {
+  const bw = u(140), bh = u(110), x = cx - bw/2, y = cy - bh/2;
+  ctx.fillStyle = valide ? rgba(CYAN, 18) : rgba(BLK, 6); ctx.fillRect(x, y, bw, bh);
+  ctx.strokeStyle = valide ? rgba(CYAN) : rgba(BLK, 50); ctx.lineWidth = valide ? 1.5 : 0.8;
+  ctx.strokeRect(x, y, bw, bh);
+  if (!valide && prog > 0) { ctx.fillStyle = rgba(MAG, 60); ctx.fillRect(x, y + bh - u(6), bw * prog, u(6)); }
+  txt(nom, cx, cy - u(10), 60, rgba(valide ? CYAN : MAG));
+  txt(label, cx, cy + u(38), 11, valide ? rgba(CYAN) : rgba(BLK, 120), { bold: false });
+  if (valide) txt("OK", cx, cy + u(54), 12, rgba(CYAN));
+}
+
+function drawProgDots(current, total, y) {
+  const sx = W/2 - (total * u(24)) / 2;
+  for (let i = 0; i < total; i++) {
+    ctx.fillStyle = i < current ? rgba(CYAN) : (i === current ? rgba(BLK, 200) : rgba(BLK, 40));
+    circle(sx + i * u(24), y, i === current ? u(13) : u(7), true);
+  }
+}
+
+function drawBtn(cx, cy, w, label, key) {
+  const h = u(42), r = { x: cx - w/2, y: cy - h/2, w, h };
+  rects[key] = r;
+  const hover = hit(r);
+  ctx.fillStyle = hover ? "#1e1e1e" : "#000"; ctx.fillRect(r.x, r.y, w, h);
+  ctx.strokeStyle = rgba([255,255,255], hover ? 255 : 140); ctx.lineWidth = 1; ctx.strokeRect(r.x, r.y, w, h);
+  txt(label, cx, cy, 14, "#fff", { bold: false });
+}
+
+// ── HUD / flash ───────────────────────────────────────────────
+function drawHUD() {
+  if (phase !== -1 && phase !== 1) {
+    const r = { x: u(16), y: u(16), w: u(120), h: u(34) };
+    rects.home = r;
+    const hover = hit(r);
+    ctx.fillStyle = hover ? "#1e1e1e" : "#000"; ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = rgba([255,255,255], hover ? 255 : 100); ctx.lineWidth = 1; ctx.strokeRect(r.x, r.y, r.w, r.h);
+    txt("< Accueil", r.x + u(10), r.y + r.h/2, 12, "#fff", { bold: false, align: "left" });
+  }
+  if (phase >= 0) {
+    const labels = ["Phase 1  —  Accords", "Bravo !", "Phase 2  —  Mélodie", "Résultat"];
+    txt(labels[phase], W - u(16), u(18), 12, rgba(CYAN), { align: "right" });
+  }
+  if (personCount === 0 && phase >= 0 && phase !== 1 && phase !== 3 && camReady) {
+    txt("En attente de détection…", W/2, H/2 - u(130), 14, rgba(MAG));
+  }
+}
+function drawFlash() {
+  if (flashAlpha <= 0) return;
+  txt(flashMsg, W/2, H/2 - u(100), 22, rgba(flashCol, flashAlpha));
+  flashAlpha -= 3.5 * k;
+}
+
+// ── Halo ──────────────────────────────────────────────────────
+class Halo {
+  constructor(x, y, c) { this.x = x; this.y = y; this.col = c; this.radius = 8; this.alpha = 200; this.maxR = 80 + Math.random() * 140; }
+  update() { this.radius += (this.maxR - this.radius) * 0.055 * k; this.alpha -= 2.5 * k; }
+  draw() {
+    ctx.strokeStyle = rgba(this.col, Math.max(0, this.alpha)); ctx.lineWidth = 1.8;
+    circle(this.x, this.y, this.radius * 2, false);
+    ctx.strokeStyle = rgba(this.col, Math.max(0, this.alpha * 0.3)); ctx.lineWidth = 0.8;
+    circle(this.x, this.y, this.radius * 3, false);
+  }
+  isDead() { return this.alpha <= 0; }
+}
+
+// ── Interactions ──────────────────────────────────────────────
+function beginPlay() {
+  accordIdx = 0; accordPlaying = false; phase = 0;
+  framesOn = 0; framesTotal = 0; scorePct = 0;
+  loadAccord(0);
+}
+async function startGame() {
+  initAudio();                       // doit se faire dans le clic (autoplay)
+  if (camReady && landmarker) { beginPlay(); return; }
+  status = "loading"; errMsg = "";
+  try {
+    if (!camReady) { await startCamera(); camReady = true; }
+    if (!landmarker) await loadTracker();
+    status = "idle"; beginPlay();
+  } catch (e) {
+    console.error(e);
+    status = "error"; errMsg = friendlyError(e);
+  }
+}
+
+function pointer(e) {
+  const r = cv.getBoundingClientRect();
+  mouseX = e.clientX - r.left; mouseY = e.clientY - r.top;
+}
+cv.addEventListener("pointermove", pointer);
+cv.addEventListener("pointerdown", e => {
+  pointer(e);
+  if (hit(rects.home)) { silence(); phase = -1; return; }
+  if (phase === -1) {
+    if (hit(rects.start) && status !== "loading") startGame();
+    else if (hit(rects.swap)) swapHands = !swapHands;
+    return;
+  }
+  if (phase === 3 && hit(rects.replay)) beginPlay();
+});
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape" && phase !== -1) { silence(); phase = -1; }
+});
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
